@@ -1,0 +1,108 @@
+import cv2
+import torch
+import pytesseract
+import sqlite3
+from flask import Flask, render_template
+from datetime import datetime
+import threading
+
+# Khởi tạo Flask
+app = Flask(__name__)
+
+# Tải mô hình YOLOv5
+model = torch.hub.load('ultralytics/yolov5', 'yolov5s')  
+
+# Thiết lập cơ sở dữ liệu
+def init_db():
+    conn = sqlite3.connect('vehicle_log.db')
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS VehicleLogs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plate TEXT NOT NULL,
+            entry_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            exit_time TIMESTAMP
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+# Phát hiện biển số trong khung hình
+def detect_license_plate(frame):
+    results = model(frame)
+    detections = results.xyxy[0]  # [xmin, ymin, xmax, ymax, độ tin cậy, lớp]
+    plates = []
+    for *box, conf, cls in detections:
+        if cls == 0:  # Giả sử '0' là lớp cho biển số xe
+            xmin, ymin, xmax, ymax = map(int, box)
+            plate_img = frame[ymin:ymax, xmin:xmax]
+            plates.append(plate_img)
+    return plates
+
+# Sử dụng OCR để nhận dạng văn bản biển số
+def recognize_text_from_plate(plate_img):
+    gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
+    plate_text = pytesseract.image_to_string(gray, config='--psm 8')
+    return plate_text.strip()
+
+# Ghi nhật ký vào cơ sở dữ liệu
+def log_entry(plate):
+    conn = sqlite3.connect('vehicle_log.db')
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO VehicleLogs (plate) VALUES (?)", (plate,))
+    conn.commit()
+    conn.close()
+
+# Ghi thời gian ra vào cơ sở dữ liệu
+def log_exit(plate):
+    conn = sqlite3.connect('vehicle_log.db')
+    cursor = conn.cursor()
+    cursor.execute("UPDATE VehicleLogs SET exit_time = ? WHERE plate = ? AND exit_time IS NULL", (datetime.now(), plate))
+    conn.commit()
+    conn.close()
+
+# Định tuyến cho bảng điều khiển HTML
+@app.route('/')
+def dashboard():
+    conn = sqlite3.connect('vehicle_log.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT plate, entry_time, exit_time FROM VehicleLogs")
+    logs = cursor.fetchall()
+    conn.close()
+    return render_template('dashboard.html', logs=logs)
+
+# Bắt đầu luồng video và giám sát phương tiện
+def monitor_vehicles():
+    cap = cv2.VideoCapture(0)  # Sử dụng 0 cho webcam hoặc đường dẫn tập tin cho video
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Phát hiện biển số xe trong khung hình
+        plates = detect_license_plate(frame)
+        for plate_img in plates:
+            if plate_text := recognize_text_from_plate(plate_img):
+                # Ghi nhận vào (hoặc ra tùy thuộc vào logic của bạn)
+                log_entry(plate_text)
+                print(f"Logged entry for plate: {plate_text}")
+
+        cv2.imshow("Vehicle Monitoring", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+# Luồng ứng dụng Flask
+def run_flask_app():
+    app.run(debug=True)
+
+# Khởi tạo cơ sở dữ liệu
+init_db()
+
+# Khởi động ứng dụng Flask và giám sát phương tiện song song
+if __name__ == "__main__":
+    threading.Thread(target=run_flask_app).start()
+    monitor_vehicles()
